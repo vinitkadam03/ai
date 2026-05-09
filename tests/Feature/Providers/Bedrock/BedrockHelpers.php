@@ -53,10 +53,7 @@ trait BedrockHelpers
     {
         return new class($client) extends BedrockTextGateway
         {
-            public function __construct(private BedrockRuntimeClient $stub)
-            {
-                parent::__construct();
-            }
+            public function __construct(private BedrockRuntimeClient $stub) {}
 
             protected function createBedrockClient(Provider $provider, ?int $timeout = null): BedrockRuntimeClient
             {

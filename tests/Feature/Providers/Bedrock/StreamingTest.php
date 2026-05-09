@@ -1,7 +1,5 @@
 <?php
 
-use Aws\MockHandler;
-use Aws\Result;
 use Laravel\Ai\Streaming\Events\ReasoningDelta;
 use Laravel\Ai\Streaming\Events\ReasoningEnd;
 use Laravel\Ai\Streaming\Events\ReasoningStart;
@@ -70,29 +68,21 @@ describe('text streaming', function () {
             ->and($textStarts[0]->messageId)->not->toBe($textStarts[1]->messageId);
     });
 
-    test('streaming round-trips reasoning block on follow-up tool step', function () {
-        $mock = new MockHandler([
-            new Result(['stream' => [
-                $this->contentBlockStart(0),
-                $this->contentBlockDelta(0, ['reasoningContent' => ['text' => 'I should call the tool']]),
-                $this->contentBlockDelta(0, ['reasoningContent' => ['signature' => 'sig-xyz']]),
-                $this->contentBlockStop(0),
-                $this->contentBlockStart(1, ['toolUse' => ['toolUseId' => 't1', 'name' => 'FixedNumberGenerator']]),
-                $this->contentBlockDelta(1, ['toolUse' => ['input' => '{}']]),
-                $this->contentBlockStop(1),
-                $this->messageStop('tool_use'),
-            ]]),
-            new Result(['stream' => [
-                $this->contentBlockStart(0),
-                $this->contentBlockDelta(0, ['text' => 'Done']),
-                $this->contentBlockStop(0),
-                $this->messageStop('end_turn'),
-            ]]),
+    test('streaming captures reasoning block into providerContentBlocks on StreamEnd', function () {
+        $client = $this->fakeBedrockStream([
+            $this->contentBlockStart(0),
+            $this->contentBlockDelta(0, ['reasoningContent' => ['text' => 'I should call the tool']]),
+            $this->contentBlockDelta(0, ['reasoningContent' => ['signature' => 'sig-xyz']]),
+            $this->contentBlockStop(0),
+            $this->contentBlockStart(1, ['toolUse' => ['toolUseId' => 't1', 'name' => 'FixedNumberGenerator']]),
+            $this->contentBlockDelta(1, ['toolUse' => ['input' => '{}']]),
+            $this->contentBlockStop(1),
+            $this->messageStop('tool_use'),
         ]);
 
-        $gateway = $this->gatewayWithClient($this->bedrockClient($mock));
+        $gateway = $this->gatewayWithClient($client);
 
-        iterator_to_array(
+        $events = iterator_to_array(
             $gateway->streamText(
                 'inv-1',
                 $this->bedrockProvider(),
@@ -103,11 +93,10 @@ describe('text streaming', function () {
             preserve_keys: false,
         );
 
-        $secondCall = $mock->getLastCommand()->toArray();
-        $assistantTurn = $secondCall['messages'][0];
+        $streamEnd = end($events);
 
-        expect($assistantTurn['role'])->toBe('assistant')
-            ->and($assistantTurn['content'][0])->toBe([
+        expect($streamEnd)->toBeInstanceOf(StreamEnd::class)
+            ->and($streamEnd->providerContentBlocks[0])->toBe([
                 'reasoningContent' => [
                     'reasoningText' => [
                         'text' => 'I should call the tool',
@@ -115,32 +104,24 @@ describe('text streaming', function () {
                     ],
                 ],
             ])
-            ->and($assistantTurn['content'][1]['toolUse']['toolUseId'])->toBe('t1')
-            ->and($assistantTurn['content'][1]['toolUse']['name'])->toBe('FixedNumberGenerator');
+            ->and($streamEnd->providerContentBlocks[1]['toolUse']['toolUseId'])->toBe('t1')
+            ->and($streamEnd->providerContentBlocks[1]['toolUse']['name'])->toBe('FixedNumberGenerator');
     });
 
-    test('streaming round-trips redacted reasoning block', function () {
-        $mock = new MockHandler([
-            new Result(['stream' => [
-                $this->contentBlockStart(0),
-                $this->contentBlockDelta(0, ['reasoningContent' => ['redactedContent' => 'redacted-bytes']]),
-                $this->contentBlockStop(0),
-                $this->contentBlockStart(1, ['toolUse' => ['toolUseId' => 't1', 'name' => 'FixedNumberGenerator']]),
-                $this->contentBlockDelta(1, ['toolUse' => ['input' => '{}']]),
-                $this->contentBlockStop(1),
-                $this->messageStop('tool_use'),
-            ]]),
-            new Result(['stream' => [
-                $this->contentBlockStart(0),
-                $this->contentBlockDelta(0, ['text' => 'Done']),
-                $this->contentBlockStop(0),
-                $this->messageStop('end_turn'),
-            ]]),
+    test('streaming captures redacted reasoning block into providerContentBlocks on StreamEnd', function () {
+        $client = $this->fakeBedrockStream([
+            $this->contentBlockStart(0),
+            $this->contentBlockDelta(0, ['reasoningContent' => ['redactedContent' => 'redacted-bytes']]),
+            $this->contentBlockStop(0),
+            $this->contentBlockStart(1, ['toolUse' => ['toolUseId' => 't1', 'name' => 'FixedNumberGenerator']]),
+            $this->contentBlockDelta(1, ['toolUse' => ['input' => '{}']]),
+            $this->contentBlockStop(1),
+            $this->messageStop('tool_use'),
         ]);
 
-        $gateway = $this->gatewayWithClient($this->bedrockClient($mock));
+        $gateway = $this->gatewayWithClient($client);
 
-        iterator_to_array(
+        $events = iterator_to_array(
             $gateway->streamText(
                 'inv-1',
                 $this->bedrockProvider(),
@@ -151,10 +132,9 @@ describe('text streaming', function () {
             preserve_keys: false,
         );
 
-        $secondCall = $mock->getLastCommand()->toArray();
-        $assistantTurn = $secondCall['messages'][0];
+        $streamEnd = end($events);
 
-        expect($assistantTurn['content'][0])->toBe([
+        expect($streamEnd->providerContentBlocks[0])->toBe([
             'reasoningContent' => ['redactedContent' => 'redacted-bytes'],
         ]);
     });

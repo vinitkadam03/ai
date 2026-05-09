@@ -16,7 +16,8 @@ use Laravel\Ai\Enums\Lab;
 use Laravel\Ai\Gateway\Bedrock\Concerns\CreatesBedrockClient;
 use Laravel\Ai\Gateway\Bedrock\Concerns\MapsAttachments;
 use Laravel\Ai\Gateway\Concerns\HandlesFailoverErrors;
-use Laravel\Ai\Gateway\Concerns\InvokesTools;
+use Laravel\Ai\Gateway\SingleTurnResponse;
+use Laravel\Ai\Gateway\StepContext;
 use Laravel\Ai\Gateway\TextGenerationOptions;
 use Laravel\Ai\Messages\AssistantMessage;
 use Laravel\Ai\Messages\Message;
@@ -26,13 +27,9 @@ use Laravel\Ai\Messages\UserMessage;
 use Laravel\Ai\ObjectSchema;
 use Laravel\Ai\Responses\Data\FinishReason;
 use Laravel\Ai\Responses\Data\Meta;
-use Laravel\Ai\Responses\Data\Step;
 use Laravel\Ai\Responses\Data\ToolCall;
-use Laravel\Ai\Responses\Data\ToolResult;
 use Laravel\Ai\Responses\Data\Usage;
 use Laravel\Ai\Responses\EmbeddingsResponse;
-use Laravel\Ai\Responses\StructuredTextResponse;
-use Laravel\Ai\Responses\TextResponse;
 use Laravel\Ai\Streaming\Events\ReasoningDelta;
 use Laravel\Ai\Streaming\Events\ReasoningEnd;
 use Laravel\Ai\Streaming\Events\ReasoningStart;
@@ -42,7 +39,6 @@ use Laravel\Ai\Streaming\Events\TextDelta;
 use Laravel\Ai\Streaming\Events\TextEnd;
 use Laravel\Ai\Streaming\Events\TextStart;
 use Laravel\Ai\Streaming\Events\ToolCall as ToolCallEvent;
-use Laravel\Ai\Streaming\Events\ToolResult as ToolResultEvent;
 use Laravel\Ai\Tools\ToolNameResolver;
 use stdClass;
 use Throwable;
@@ -51,15 +47,9 @@ class BedrockTextGateway implements EmbeddingGateway, TextGateway
 {
     use CreatesBedrockClient;
     use HandlesFailoverErrors;
-    use InvokesTools;
     use MapsAttachments;
 
     protected const STRUCTURED_OUTPUT_TOOL = 'structured_output';
-
-    public function __construct()
-    {
-        $this->initializeToolCallbacks();
-    }
 
     /**
      * {@inheritdoc}
@@ -73,131 +63,86 @@ class BedrockTextGateway implements EmbeddingGateway, TextGateway
         ?array $schema = null,
         ?TextGenerationOptions $options = null,
         ?int $timeout = null,
-    ): TextResponse {
+        ?string $previousResponseId = null,
+        ?StepContext $context = null,
+    ): SingleTurnResponse {
         $client = $this->createBedrockClient($provider, $timeout);
-        $conversationMessages = $this->formatMessages($messages);
-        $maxSteps = $this->resolveMaxSteps($tools, $options);
         $schemaTools = $schema ? $this->buildSchemaTools($schema, $tools) : null;
         $formattedTools = $schemaTools === null && ! empty($tools) ? $this->formatTools($tools) : null;
 
-        $allToolCalls = [];
-        $allToolResults = [];
-        $finalOutput = '';
-        $totalUsage = new Usage;
-        $step = 0;
-        $responseMessages = new Collection;
-        $steps = new Collection;
-        $meta = new Meta($provider->name(), $model);
+        $parameters = $this->buildConverseParameters(
+            $model,
+            $instructions,
+            $this->formatMessages($messages),
+            $schemaTools,
+            $formattedTools,
+            empty($tools),
+            $options,
+            isFinalStep: $context?->isFinalStep ?? false,
+        );
 
-        while ($step < $maxSteps) {
-            $parameters = $this->buildConverseParameters(
-                $model,
-                $instructions,
-                $conversationMessages,
-                $schemaTools,
-                $formattedTools,
-                empty($tools),
-                $options,
-                isFinalStep: ($step + 1) >= $maxSteps,
+        try {
+            $response = $this->withErrorHandling(
+                $provider->name(),
+                fn () => $client->converse($parameters),
             );
 
-            try {
-                $response = $this->withErrorHandling(
-                    $provider->name(),
-                    fn () => $client->converse($parameters),
-                );
+            $result = $response->toArray();
+        } catch (Throwable $e) {
+            throw BedrockException::toAiException($e, $provider->name(), $model);
+        }
 
-                $result = $response->toArray();
-            } catch (Throwable $e) {
-                throw BedrockException::toAiException($e, $provider->name(), $model);
+        $text = '';
+        $toolCalls = [];
+        $structured = null;
+        $providerContentBlocks = [];
+
+        foreach ($result['output']['message']['content'] ?? [] as $block) {
+            $providerContentBlocks[] = $block;
+
+            if (isset($block['text'])) {
+                $text .= $block['text'];
+
+                continue;
             }
 
-            $stepUsage = new Usage(
+            if (! isset($block['toolUse'])) {
+                continue;
+            }
+
+            if ($schemaTools && $block['toolUse']['name'] === self::STRUCTURED_OUTPUT_TOOL) {
+                $structured = $block['toolUse']['input'] ?? [];
+
+                continue;
+            }
+
+            $toolCalls[] = new ToolCall(
+                $block['toolUse']['toolUseId'],
+                $block['toolUse']['name'],
+                $block['toolUse']['input'] ?? [],
+            );
+        }
+
+        $finishReason = $this->extractFinishReason($result);
+
+        if ($schemaTools && $finishReason === FinishReason::ToolCalls && empty($toolCalls)) {
+            $finishReason = FinishReason::Stop;
+        }
+
+        return new SingleTurnResponse(
+            text: $structured !== null ? json_encode($structured) : $text,
+            toolCalls: $toolCalls,
+            finishReason: $finishReason,
+            usage: new Usage(
                 promptTokens: $result['usage']['inputTokens'] ?? 0,
                 completionTokens: $result['usage']['outputTokens'] ?? 0,
                 cacheWriteInputTokens: $result['usage']['cacheWriteInputTokens'] ?? 0,
                 cacheReadInputTokens: $result['usage']['cacheReadInputTokens'] ?? 0,
-            );
-            $totalUsage = $totalUsage->add($stepUsage);
-
-            $output = '';
-            $toolCalls = [];
-            $providerContentBlocks = [];
-
-            foreach ($result['output']['message']['content'] ?? [] as $block) {
-                $providerContentBlocks[] = $block;
-
-                if (isset($block['text'])) {
-                    $output .= $block['text'];
-
-                    continue;
-                }
-
-                if (! isset($block['toolUse'])) {
-                    continue;
-                }
-
-                if ($schemaTools && $block['toolUse']['name'] === self::STRUCTURED_OUTPUT_TOOL) {
-                    $finalOutput = json_encode($block['toolUse']['input'] ?? []);
-
-                    continue;
-                }
-
-                $toolCalls[] = new ToolCall(
-                    $block['toolUse']['toolUseId'],
-                    $block['toolUse']['name'],
-                    $block['toolUse']['input'] ?? [],
-                );
-            }
-
-            if (! $schemaTools) {
-                $finalOutput = $output;
-            }
-
-            $step++;
-            $finishReason = $this->extractFinishReason($result);
-
-            $responseMessages->push(new AssistantMessage($output, new Collection($toolCalls), $providerContentBlocks));
-
-            if (empty($toolCalls)) {
-                if ($schemaTools && $finishReason === FinishReason::ToolCalls) {
-                    $finishReason = FinishReason::Stop;
-                }
-
-                $steps->push(new Step($output, $toolCalls, [], $finishReason, $stepUsage, $meta));
-
-                break;
-            }
-
-            $allToolCalls = array_merge($allToolCalls, $toolCalls);
-            $conversationMessages[] = $this->buildAssistantConversationMessage($output, $toolCalls, $providerContentBlocks);
-
-            $toolResults = $this->executeToolCalls($tools, $toolCalls);
-            $allToolResults = array_merge($allToolResults, $toolResults);
-
-            $steps->push(new Step($output, $toolCalls, $toolResults, $finishReason, $stepUsage, $meta));
-
-            if (! empty($toolResults)) {
-                $conversationMessages[] = $this->buildToolResultConversationMessage($toolResults);
-                $responseMessages->push(new ToolResultMessage(new Collection($toolResults)));
-            }
-        }
-
-        if ($schema) {
-            $structured = json_decode($finalOutput, true);
-
-            if (json_last_error() !== JSON_ERROR_NONE) {
-                $structured = [];
-            }
-
-            return (new StructuredTextResponse($structured, $finalOutput, $totalUsage, $meta))
-                ->withToolCallsAndResults(new Collection($allToolCalls), new Collection($allToolResults))
-                ->withSteps($steps);
-        }
-
-        return (new TextResponse($finalOutput, $totalUsage, $meta))
-            ->withMessages($responseMessages)
-            ->withSteps($steps);
+            ),
+            meta: new Meta($provider->name(), $model),
+            structured: $structured,
+            providerContentBlocks: $providerContentBlocks,
+        );
     }
 
     /**
@@ -213,298 +158,292 @@ class BedrockTextGateway implements EmbeddingGateway, TextGateway
         ?array $schema = null,
         ?TextGenerationOptions $options = null,
         ?int $timeout = null,
+        ?string $previousResponseId = null,
+        ?StepContext $context = null,
     ): Generator {
         $client = $this->createBedrockClient($provider, $timeout);
-        $conversationMessages = $this->formatMessages($messages);
-        $maxSteps = $this->resolveMaxSteps($tools, $options);
         $schemaTools = $schema ? $this->buildSchemaTools($schema, $tools) : null;
         $formattedTools = $schemaTools === null && ! empty($tools) ? $this->formatTools($tools) : null;
 
+        $parameters = $this->buildConverseParameters(
+            $model,
+            $instructions,
+            $this->formatMessages($messages),
+            $schemaTools,
+            $formattedTools,
+            empty($tools),
+            $options,
+            isFinalStep: $context?->isFinalStep ?? false,
+        );
+
+        try {
+            $response = $this->withErrorHandling(
+                $provider->name(),
+                fn () => $client->converseStream($parameters),
+            );
+        } catch (Throwable $e) {
+            throw BedrockException::toAiException($e, $provider->name(), $model);
+        }
+
         $messageId = (string) Str::uuid();
         $timestamp = time();
-        $totalUsage = new Usage;
-        $step = 0;
 
-        while ($step < $maxSteps) {
-            $parameters = $this->buildConverseParameters(
-                $model,
-                $instructions,
-                $conversationMessages,
-                $schemaTools,
-                $formattedTools,
-                empty($tools),
-                $options,
-                isFinalStep: ($step + 1) >= $maxSteps,
-            );
+        yield (new StreamStart(
+            (string) Str::uuid(),
+            $provider->name(),
+            $model,
+            $timestamp,
+        ))->withInvocationId($invocationId);
 
-            try {
-                $response = $this->withErrorHandling(
-                    $provider->name(),
-                    fn () => $client->converseStream($parameters),
-                );
-            } catch (Throwable $e) {
-                throw BedrockException::toAiException($e, $provider->name(), $model);
+        $pendingToolCalls = [];
+        $toolCalls = [];
+        $structuredOutput = null;
+        $currentBlockIndex = null;
+        $currentBlockType = '';
+        $responseContent = [];
+        $reasoningId = '';
+        $textId = '';
+        $currentText = '';
+        $currentReasoningText = '';
+        $currentReasoningSignature = '';
+        $currentReasoningRedacted = '';
+        $stopReason = 'stop';
+        $inputTokens = 0;
+        $outputTokens = 0;
+        $cacheReadInputTokens = 0;
+        $cacheWriteInputTokens = 0;
+
+        $emitTextStart = function () use (&$textId, $invocationId, $timestamp) {
+            if ($textId !== '') {
+                return null;
             }
 
-            yield (new StreamStart(
+            $textId = (string) Str::uuid();
+
+            return (new TextStart(
                 (string) Str::uuid(),
-                $provider->name(),
-                $model,
+                $textId,
                 $timestamp,
             ))->withInvocationId($invocationId);
+        };
 
-            $assistantText = '';
-            $pendingToolCalls = [];
-            $toolCalls = [];
-            $structuredOutput = null;
-            $currentBlockIndex = null;
-            $currentBlockType = '';
-            $responseContent = [];
-            $reasoningId = '';
-            $textId = '';
-            $currentText = '';
-            $currentReasoningText = '';
-            $currentReasoningSignature = '';
-            $currentReasoningRedacted = '';
-            $stopReason = 'stop';
+        $emitReasoningStart = function () use (&$reasoningId, $invocationId, $timestamp) {
+            if ($reasoningId !== '') {
+                return null;
+            }
 
-            $emitTextStart = function () use (&$textId, $invocationId, $timestamp) {
-                if ($textId !== '') {
-                    return null;
+            $reasoningId = (string) Str::uuid();
+
+            return (new ReasoningStart(
+                (string) Str::uuid(),
+                $reasoningId,
+                $timestamp,
+            ))->withInvocationId($invocationId);
+        };
+
+        foreach ($response['stream'] as $event) {
+            if (isset($event['contentBlockStart'])) {
+                $currentBlockIndex = $event['contentBlockStart']['contentBlockIndex'] ?? 0;
+                $start = $event['contentBlockStart']['start'] ?? [];
+                $currentBlockType = isset($start['toolUse']) ? 'toolUse' : '';
+
+                if (isset($start['toolUse'])) {
+                    $pendingToolCalls[$currentBlockIndex] = [
+                        'id' => $start['toolUse']['toolUseId'] ?? '',
+                        'name' => $start['toolUse']['name'] ?? '',
+                        'input' => '',
+                    ];
                 }
 
-                $textId = (string) Str::uuid();
+                continue;
+            }
 
-                return (new TextStart(
-                    (string) Str::uuid(),
-                    $textId,
-                    $timestamp,
-                ))->withInvocationId($invocationId);
-            };
+            if (isset($event['contentBlockDelta'])) {
+                $index = $event['contentBlockDelta']['contentBlockIndex'] ?? $currentBlockIndex;
+                $delta = $event['contentBlockDelta']['delta'] ?? [];
 
-            $emitReasoningStart = function () use (&$reasoningId, $invocationId, $timestamp) {
-                if ($reasoningId !== '') {
-                    return null;
+                if (isset($delta['text'])) {
+                    $currentBlockType = 'text';
+
+                    if ($emittedEvent = $emitTextStart()) {
+                        yield $emittedEvent;
+                    }
+
+                    $currentText .= $delta['text'];
+
+                    yield (new TextDelta(
+                        (string) Str::uuid(),
+                        $textId,
+                        $delta['text'],
+                        $timestamp,
+                    ))->withInvocationId($invocationId);
+                } elseif (isset($delta['reasoningContent']['text'])) {
+                    $currentBlockType = 'reasoning';
+
+                    if ($emittedEvent = $emitReasoningStart()) {
+                        yield $emittedEvent;
+                    }
+
+                    $currentReasoningText .= $delta['reasoningContent']['text'];
+
+                    yield (new ReasoningDelta(
+                        (string) Str::uuid(),
+                        $reasoningId,
+                        $delta['reasoningContent']['text'],
+                        $timestamp,
+                    ))->withInvocationId($invocationId);
+                } elseif (isset($delta['reasoningContent']['signature'])) {
+                    $currentBlockType = 'reasoning';
+
+                    if ($emittedEvent = $emitReasoningStart()) {
+                        yield $emittedEvent;
+                    }
+
+                    $currentReasoningSignature .= $delta['reasoningContent']['signature'];
+                } elseif (isset($delta['reasoningContent']['redactedContent'])) {
+                    $currentBlockType = 'reasoning';
+
+                    if ($emittedEvent = $emitReasoningStart()) {
+                        yield $emittedEvent;
+                    }
+
+                    $currentReasoningRedacted .= $delta['reasoningContent']['redactedContent'];
+                } elseif (isset($delta['toolUse']['input'], $pendingToolCalls[$index])) {
+                    $pendingToolCalls[$index]['input'] .= $delta['toolUse']['input'];
                 }
 
-                $reasoningId = (string) Str::uuid();
+                continue;
+            }
 
-                return (new ReasoningStart(
-                    (string) Str::uuid(),
-                    $reasoningId,
-                    $timestamp,
-                ))->withInvocationId($invocationId);
-            };
+            if (isset($event['contentBlockStop'])) {
+                $index = $event['contentBlockStop']['contentBlockIndex'] ?? $currentBlockIndex;
 
-            foreach ($response['stream'] as $event) {
-                if (isset($event['contentBlockStart'])) {
-                    $currentBlockIndex = $event['contentBlockStart']['contentBlockIndex'] ?? 0;
-                    $start = $event['contentBlockStart']['start'] ?? [];
-                    $currentBlockType = isset($start['toolUse']) ? 'toolUse' : '';
-
-                    if (isset($start['toolUse'])) {
-                        $pendingToolCalls[$currentBlockIndex] = [
-                            'id' => $start['toolUse']['toolUseId'] ?? '',
-                            'name' => $start['toolUse']['name'] ?? '',
-                            'input' => '',
+                if ($currentBlockType === 'reasoning') {
+                    if ($currentReasoningRedacted !== '') {
+                        $responseContent[$index] = [
+                            'reasoningContent' => [
+                                'redactedContent' => $currentReasoningRedacted,
+                            ],
+                        ];
+                    } else {
+                        $responseContent[$index] = [
+                            'reasoningContent' => [
+                                'reasoningText' => [
+                                    'text' => $currentReasoningText,
+                                    'signature' => $currentReasoningSignature,
+                                ],
+                            ],
                         ];
                     }
 
-                    continue;
-                }
+                    yield (new ReasoningEnd(
+                        (string) Str::uuid(),
+                        $reasoningId,
+                        $timestamp,
+                    ))->withInvocationId($invocationId);
 
-                if (isset($event['contentBlockDelta'])) {
-                    $index = $event['contentBlockDelta']['contentBlockIndex'] ?? $currentBlockIndex;
-                    $delta = $event['contentBlockDelta']['delta'] ?? [];
+                    $currentReasoningText = '';
+                    $currentReasoningSignature = '';
+                    $currentReasoningRedacted = '';
+                    $reasoningId = '';
+                } elseif ($currentBlockType === 'text' && $textId !== '') {
+                    $responseContent[$index] = ['text' => $currentText];
 
-                    if (isset($delta['text'])) {
-                        $currentBlockType = 'text';
+                    yield (new TextEnd(
+                        (string) Str::uuid(),
+                        $textId,
+                        $timestamp,
+                    ))->withInvocationId($invocationId);
 
-                        if ($emittedEvent = $emitTextStart()) {
-                            yield $emittedEvent;
-                        }
+                    $currentText = '';
+                    $textId = '';
+                } elseif ($currentBlockType === 'toolUse' && isset($pendingToolCalls[$index])) {
+                    $pending = $pendingToolCalls[$index];
+                    $arguments = json_decode($pending['input'] !== '' ? $pending['input'] : '{}', true) ?? [];
 
-                        $assistantText .= $delta['text'];
-                        $currentText .= $delta['text'];
+                    if ($schemaTools && $pending['name'] === self::STRUCTURED_OUTPUT_TOOL) {
+                        $structuredOutput = json_encode($arguments);
+                    } else {
+                        $toolCall = new ToolCall($pending['id'], $pending['name'], $arguments);
+                        $toolCalls[] = $toolCall;
+                        $responseContent[$index] = [
+                            'toolUse' => [
+                                'toolUseId' => $toolCall->id,
+                                'name' => $toolCall->name,
+                                'input' => $arguments,
+                            ],
+                        ];
 
-                        yield (new TextDelta(
+                        yield (new ToolCallEvent(
                             (string) Str::uuid(),
-                            $textId,
-                            $delta['text'],
+                            $toolCall,
                             $timestamp,
                         ))->withInvocationId($invocationId);
-                    } elseif (isset($delta['reasoningContent']['text'])) {
-                        $currentBlockType = 'reasoning';
-
-                        if ($emittedEvent = $emitReasoningStart()) {
-                            yield $emittedEvent;
-                        }
-
-                        $currentReasoningText .= $delta['reasoningContent']['text'];
-
-                        yield (new ReasoningDelta(
-                            (string) Str::uuid(),
-                            $reasoningId,
-                            $delta['reasoningContent']['text'],
-                            $timestamp,
-                        ))->withInvocationId($invocationId);
-                    } elseif (isset($delta['reasoningContent']['signature'])) {
-                        $currentBlockType = 'reasoning';
-
-                        if ($emittedEvent = $emitReasoningStart()) {
-                            yield $emittedEvent;
-                        }
-
-                        $currentReasoningSignature .= $delta['reasoningContent']['signature'];
-                    } elseif (isset($delta['reasoningContent']['redactedContent'])) {
-                        $currentBlockType = 'reasoning';
-
-                        if ($emittedEvent = $emitReasoningStart()) {
-                            yield $emittedEvent;
-                        }
-
-                        $currentReasoningRedacted .= $delta['reasoningContent']['redactedContent'];
-                    } elseif (isset($delta['toolUse']['input'], $pendingToolCalls[$index])) {
-                        $pendingToolCalls[$index]['input'] .= $delta['toolUse']['input'];
                     }
 
-                    continue;
+                    unset($pendingToolCalls[$index]);
                 }
 
-                if (isset($event['contentBlockStop'])) {
-                    $index = $event['contentBlockStop']['contentBlockIndex'] ?? $currentBlockIndex;
+                $currentBlockType = '';
 
-                    if ($currentBlockType === 'reasoning') {
-                        if ($currentReasoningRedacted !== '') {
-                            $responseContent[$index] = [
-                                'reasoningContent' => [
-                                    'redactedContent' => $currentReasoningRedacted,
-                                ],
-                            ];
-                        } else {
-                            $responseContent[$index] = [
-                                'reasoningContent' => [
-                                    'reasoningText' => [
-                                        'text' => $currentReasoningText,
-                                        'signature' => $currentReasoningSignature,
-                                    ],
-                                ],
-                            ];
-                        }
-
-                        yield (new ReasoningEnd(
-                            (string) Str::uuid(),
-                            $reasoningId,
-                            $timestamp,
-                        ))->withInvocationId($invocationId);
-
-                        $currentReasoningText = '';
-                        $currentReasoningSignature = '';
-                        $currentReasoningRedacted = '';
-                        $reasoningId = '';
-                    } elseif ($currentBlockType === 'text' && $textId !== '') {
-                        $responseContent[$index] = ['text' => $currentText];
-
-                        yield (new TextEnd(
-                            (string) Str::uuid(),
-                            $textId,
-                            $timestamp,
-                        ))->withInvocationId($invocationId);
-
-                        $currentText = '';
-                        $textId = '';
-                    } elseif ($currentBlockType === 'toolUse' && isset($pendingToolCalls[$index])) {
-                        $pending = $pendingToolCalls[$index];
-                        $arguments = json_decode($pending['input'] !== '' ? $pending['input'] : '{}', true) ?? [];
-
-                        if ($schemaTools && $pending['name'] === self::STRUCTURED_OUTPUT_TOOL) {
-                            $structuredOutput = json_encode($arguments);
-                        } else {
-                            $toolCall = new ToolCall($pending['id'], $pending['name'], $arguments);
-                            $toolCalls[] = $toolCall;
-                            $responseContent[$index] = [
-                                'toolUse' => [
-                                    'toolUseId' => $toolCall->id,
-                                    'name' => $toolCall->name,
-                                    'input' => $arguments,
-                                ],
-                            ];
-
-                            yield (new ToolCallEvent(
-                                (string) Str::uuid(),
-                                $toolCall,
-                                $timestamp,
-                            ))->withInvocationId($invocationId);
-                        }
-
-                        unset($pendingToolCalls[$index]);
-                    }
-
-                    $currentBlockType = '';
-
-                    continue;
-                }
-
-                if (isset($event['messageStop'])) {
-                    $stopReason = $event['messageStop']['stopReason'] ?? 'stop';
-
-                    continue;
-                }
-
-                if (isset($event['metadata']['usage'])) {
-                    $totalUsage = $totalUsage->add(new Usage(
-                        promptTokens: $event['metadata']['usage']['inputTokens'] ?? 0,
-                        completionTokens: $event['metadata']['usage']['outputTokens'] ?? 0,
-                        cacheWriteInputTokens: $event['metadata']['usage']['cacheWriteInputTokens'] ?? 0,
-                        cacheReadInputTokens: $event['metadata']['usage']['cacheReadInputTokens'] ?? 0,
-                    ));
-                }
+                continue;
             }
 
-            $step++;
+            if (isset($event['messageStop'])) {
+                $stopReason = $event['messageStop']['stopReason'] ?? 'stop';
 
-            if ($structuredOutput !== null) {
-                yield (new TextDelta(
-                    (string) Str::uuid(),
-                    $messageId,
-                    $structuredOutput,
-                    $timestamp,
-                ))->withInvocationId($invocationId);
+                continue;
             }
 
-            if (empty($toolCalls)) {
-                break;
-            }
-
-            $conversationMessages[] = $this->buildAssistantConversationMessage($assistantText, $toolCalls, array_values($responseContent));
-
-            $toolResults = $this->executeToolCalls($tools, $toolCalls);
-
-            foreach ($toolResults as $toolResult) {
-                yield (new ToolResultEvent(
-                    (string) Str::uuid(),
-                    $toolResult,
-                    true,
-                    null,
-                    $timestamp,
-                ))->withInvocationId($invocationId);
-            }
-
-            if (! empty($toolResults)) {
-                $conversationMessages[] = $this->buildToolResultConversationMessage($toolResults);
-            }
-
-            if ($stopReason !== 'tool_use') {
-                break;
+            if (isset($event['metadata']['usage'])) {
+                $inputTokens += $event['metadata']['usage']['inputTokens'] ?? 0;
+                $outputTokens += $event['metadata']['usage']['outputTokens'] ?? 0;
+                $cacheReadInputTokens += $event['metadata']['usage']['cacheReadInputTokens'] ?? 0;
+                $cacheWriteInputTokens += $event['metadata']['usage']['cacheWriteInputTokens'] ?? 0;
             }
         }
 
+        if ($structuredOutput !== null) {
+            yield (new TextDelta(
+                (string) Str::uuid(),
+                $messageId,
+                $structuredOutput,
+                $timestamp,
+            ))->withInvocationId($invocationId);
+        }
+
+        $finishReason = $this->extractFinishReason(['stopReason' => $stopReason]);
+
+        if ($schemaTools && $finishReason === FinishReason::ToolCalls && empty($toolCalls)) {
+            $finishReason = FinishReason::Stop;
+        }
+
         yield (new StreamEnd(
-            $messageId,
-            'stop',
-            $totalUsage,
+            (string) Str::uuid(),
+            $finishReason->value,
+            new Usage(
+                promptTokens: $inputTokens,
+                completionTokens: $outputTokens,
+                cacheWriteInputTokens: $cacheWriteInputTokens,
+                cacheReadInputTokens: $cacheReadInputTokens,
+            ),
             $timestamp,
+            providerContentBlocks: array_values($responseContent),
         ))->withInvocationId($invocationId);
+    }
+
+    /**
+     * Extract and map the finish reason from the Bedrock Converse response.
+     */
+    protected function extractFinishReason(array $data): FinishReason
+    {
+        return match ($data['stopReason'] ?? '') {
+            'end_turn', 'stop_sequence' => FinishReason::Stop,
+            'tool_use' => FinishReason::ToolCalls,
+            'max_tokens' => FinishReason::Length,
+            'content_filtered', 'guardrail_intervened' => FinishReason::ContentFilter,
+            default => FinishReason::Unknown,
+        };
     }
 
     /**
@@ -606,34 +545,6 @@ class BedrockTextGateway implements EmbeddingGateway, TextGateway
     }
 
     /**
-     * Resolve the maximum number of steps for the given tools and options.
-     *
-     * @param  array<Tool>  $tools
-     */
-    protected function resolveMaxSteps(array $tools, ?TextGenerationOptions $options): int
-    {
-        if (empty($tools)) {
-            return 1;
-        }
-
-        return (int) ($options?->maxSteps ?? round(count($tools) * 1.5));
-    }
-
-    /**
-     * Extract and map the finish reason from the Bedrock Converse response.
-     */
-    protected function extractFinishReason(array $data): FinishReason
-    {
-        return match ($data['stopReason'] ?? '') {
-            'end_turn', 'stop_sequence' => FinishReason::Stop,
-            'tool_use' => FinishReason::ToolCalls,
-            'max_tokens' => FinishReason::Length,
-            'content_filtered', 'guardrail_intervened' => FinishReason::ContentFilter,
-            default => FinishReason::Unknown,
-        };
-    }
-
-    /**
      * Build the request parameters for the Bedrock Converse API.
      *
      * @param  array<string, mixed>|null  $schemaTools
@@ -694,56 +605,6 @@ class BedrockTextGateway implements EmbeddingGateway, TextGateway
             'temperature' => $options->temperature,
             'topP' => $options->topP,
         ]);
-    }
-
-    /**
-     * Build the assistant conversation message block combining text and tool calls.
-     *
-     * @param  array<ToolCall>  $toolCalls
-     * @param  array<int, array<string, mixed>>  $providerContentBlocks
-     */
-    protected function buildAssistantConversationMessage(string $text, array $toolCalls, array $providerContentBlocks = []): array
-    {
-        return $this->formatAssistantMessage(
-            new AssistantMessage($text, new Collection($toolCalls), $providerContentBlocks)
-        );
-    }
-
-    /**
-     * Cast empty toolUse.input arrays to objects so the Converse API doesn't reject them.
-     *
-     * @param  array<int, array<string, mixed>>  $content
-     * @return array<int, array<string, mixed>>
-     */
-    protected function ensureToolInputIsObject(array $content): array
-    {
-        return array_map(function (array $block) {
-            if (isset($block['toolUse'])) {
-                $block['toolUse']['input'] = (object) ($block['toolUse']['input'] ?? []);
-            }
-
-            return $block;
-        }, $content);
-    }
-
-    /**
-     * Build the user conversation message block carrying tool results.
-     *
-     * @param  array<ToolResult>  $toolResults
-     */
-    protected function buildToolResultConversationMessage(array $toolResults): array
-    {
-        return [
-            'role' => 'user',
-            'content' => array_map(fn (ToolResult $toolResult) => [
-                'toolResult' => [
-                    'toolUseId' => $toolResult->id,
-                    'content' => [
-                        ['text' => is_string($toolResult->result) ? $toolResult->result : json_encode($toolResult->result)],
-                    ],
-                ],
-            ], $toolResults),
-        ];
     }
 
     /**
@@ -836,6 +697,20 @@ class BedrockTextGateway implements EmbeddingGateway, TextGateway
     }
 
     /**
+     * Ensure tool_use input blocks have their input cast to object for JSON serialization.
+     */
+    protected function ensureToolInputIsObject(array $content): array
+    {
+        return array_map(function (array $block) {
+            if (isset($block['toolUse'])) {
+                $block['toolUse']['input'] = (object) ($block['toolUse']['input'] ?? []);
+            }
+
+            return $block;
+        }, $content);
+    }
+
+    /**
      * Format a ToolResultMessage for the Converse API.
      */
     protected function formatToolResultMessage(ToolResultMessage $message): array
@@ -914,43 +789,5 @@ class BedrockTextGateway implements EmbeddingGateway, TextGateway
             ])
             ->values()
             ->all();
-    }
-
-    /**
-     * Execute the tool calls against the provided tools and collect results.
-     *
-     * @param  array<Tool>  $tools
-     * @param  array<ToolCall>  $toolCalls
-     * @return array<ToolResult>
-     */
-    protected function executeToolCalls(array $tools, array $toolCalls): array
-    {
-        $results = [];
-
-        foreach ($toolCalls as $toolCall) {
-            $tool = $this->findTool($toolCall->name, $tools);
-
-            if ($tool === null) {
-                $results[] = new ToolResult(
-                    $toolCall->id,
-                    $toolCall->name,
-                    $toolCall->arguments,
-                    'Error: Tool "'.$toolCall->name.'" not found.',
-                );
-
-                continue;
-            }
-
-            $result = $this->executeTool($tool, $toolCall->arguments);
-
-            $results[] = new ToolResult(
-                $toolCall->id,
-                $toolCall->name,
-                $toolCall->arguments,
-                $result,
-            );
-        }
-
-        return $results;
     }
 }
