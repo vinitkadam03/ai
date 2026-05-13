@@ -1,10 +1,8 @@
 <?php
 
-use Illuminate\Contracts\JsonSchema\JsonSchema;
-use Illuminate\JsonSchema\Types\Type;
 use Laravel\Ai\Contracts\Tool;
 use Laravel\Ai\Gateway\Concerns\InvokesTools;
-use Laravel\Ai\Tools\Request;
+use Tests\Fixtures\Tools\CallableTool;
 
 test('tool invocation callbacks are restored after nested tool invocations', function () {
     $events = [];
@@ -19,31 +17,7 @@ test('tool invocation callbacks are restored after nested tool invocations', fun
         }
     };
 
-    $makeTool = fn (string $name, Closure $handler): Tool => new class($name, $handler) implements Tool
-    {
-        public function __construct(
-            protected string $name,
-            protected Closure $handler,
-        ) {}
-
-        public function description(): string
-        {
-            return $this->name;
-        }
-
-        public function handle(Request $request): string
-        {
-            return call_user_func($this->handler, $request);
-        }
-
-        /**
-         * @return array<string, Type>
-         */
-        public function schema(JsonSchema $schema): array
-        {
-            return [];
-        }
-    };
+    $makeTool = fn (string $name, Closure $handler): Tool => new CallableTool($name, $handler);
 
     $gateway->onToolInvocation(
         invoking: function (Tool $tool) use (&$events) {
