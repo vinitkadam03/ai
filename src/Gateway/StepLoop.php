@@ -277,6 +277,7 @@ class StepLoop
         }
 
         ksort($toolResultsByIndex);
+
         return array_values($toolResultsByIndex);
     }
 
