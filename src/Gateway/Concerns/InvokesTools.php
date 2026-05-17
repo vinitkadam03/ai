@@ -34,18 +34,49 @@ trait InvokesTools
      */
     protected function executeTool(Tool $tool, array $arguments): string
     {
+        return $this->runWithToolInvocationCallbacks(
+            $tool,
+            $arguments,
+            fn (): string => (string) $tool->handle(new Request($arguments)),
+        );
+    }
+
+    /**
+     * Run a tool body with the same invoking / invoked callbacks as {@see executeTool()}.
+     *
+     * @param  Closure(): string  $run
+     */
+    protected function runWithToolInvocationCallbacks(Tool $tool, array $arguments, Closure $run): string
+    {
         $callbacks = $this->pushToolInvocationCallbacks();
 
         try {
             call_user_func($callbacks['invoking'], $tool, $arguments);
 
             return (string) tap(
-                $tool->handle(new Request($arguments)),
+                $run(),
                 fn ($result) => call_user_func($callbacks['invoked'], $tool, $arguments, $result)
             );
         } finally {
             $this->popToolInvocationCallbacks();
         }
+    }
+
+    /**
+     * @return array{invoking: Closure, invoked: Closure}
+     */
+    protected function currentToolInvocationCallbacks(): array
+    {
+        $this->initializeToolCallbacks();
+
+        if ($this->toolInvocationCallbackStack !== []) {
+            return end($this->toolInvocationCallbackStack);
+        }
+
+        return [
+            'invoking' => $this->invokingToolCallback,
+            'invoked' => $this->toolInvokedCallback,
+        ];
     }
 
     /**

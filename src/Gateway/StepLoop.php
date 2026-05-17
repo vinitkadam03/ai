@@ -5,7 +5,9 @@ namespace Laravel\Ai\Gateway;
 use Generator;
 use Illuminate\Contracts\Events\Dispatcher;
 use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\Concurrency;
 use Illuminate\Support\Str;
+use Laravel\Ai\Attributes\Concurrent;
 use Laravel\Ai\Contracts\Gateway\TextGateway;
 use Laravel\Ai\Contracts\Providers\TextProvider;
 use Laravel\Ai\Contracts\Tool;
@@ -23,6 +25,7 @@ use Laravel\Ai\Streaming\Events\StreamEnd;
 use Laravel\Ai\Streaming\Events\TextDelta;
 use Laravel\Ai\Streaming\Events\ToolCall as ToolCallEvent;
 use Laravel\Ai\Streaming\Events\ToolResult as ToolResultEvent;
+use Laravel\Ai\Tools\Request;
 
 class StepLoop
 {
@@ -214,18 +217,57 @@ class StepLoop
      */
     protected function executeToolCalls(array $toolCalls, array $tools): array
     {
-        $results = [];
+        $toolResultsByIndex = [];
+        $concurrentToolRuns = [];
 
-        foreach ($toolCalls as $toolCall) {
+        foreach ($toolCalls as $index => $toolCall) {
             $tool = $this->findTool($toolCall->name, $tools);
 
             if ($tool === null) {
                 continue;
             }
 
-            $result = $this->executeTool($tool, $toolCall->arguments);
+            if (! Concurrent::isAppliedTo($tool)) {
+                $toolResultsByIndex[$index] = new ToolResult(
+                    $toolCall->id,
+                    $toolCall->name,
+                    $toolCall->arguments,
+                    $this->executeTool($tool, $toolCall->arguments),
+                    $toolCall->resultId,
+                );
 
-            $results[] = new ToolResult(
+                continue;
+            }
+
+            $concurrentToolRuns[$index] = [$toolCall, $tool];
+        }
+
+        if ($concurrentToolRuns === []) {
+            return array_values($toolResultsByIndex);
+        }
+
+        $callbacks = $this->currentToolInvocationCallbacks();
+
+        foreach ($concurrentToolRuns as [$toolCall, $tool]) {
+            call_user_func($callbacks['invoking'], $tool, $toolCall->arguments);
+        }
+
+        $runners = [];
+
+        foreach ($concurrentToolRuns as $index => [$toolCall, $tool]) {
+            $runners[$index] = static function () use ($tool, $toolCall): string {
+                return (string) $tool->handle(new Request($toolCall->arguments));
+            };
+        }
+
+        $concurrentResults = Concurrency::run($runners);
+
+        foreach ($concurrentToolRuns as $index => [$toolCall, $tool]) {
+            $result = $concurrentResults[$index];
+
+            call_user_func($callbacks['invoked'], $tool, $toolCall->arguments, $result);
+
+            $toolResultsByIndex[$index] = new ToolResult(
                 $toolCall->id,
                 $toolCall->name,
                 $toolCall->arguments,
@@ -234,7 +276,9 @@ class StepLoop
             );
         }
 
-        return $results;
+        ksort($toolResultsByIndex);
+
+        return array_values($toolResultsByIndex);
     }
 
     /**
