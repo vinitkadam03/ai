@@ -1,7 +1,5 @@
 <?php
 
-use Laravel\Ai\Messages\AssistantMessage;
-
 describe('reasoning capture', function () {
     test('captures reasoning content into providerContentBlocks', function () {
         $client = $this->fakeBedrockConverse([
@@ -25,12 +23,10 @@ describe('reasoning capture', function () {
             null,
         );
 
-        $assistant = $response->messages->first(fn ($m) => $m instanceof AssistantMessage);
-
-        expect($assistant->providerContentBlocks)->toEqual([
+        expect($response->providerContentBlocks)->toEqual([
             ['reasoningContent' => ['reasoningText' => ['text' => 'thinking...', 'signature' => 'sig-1']]],
             ['text' => 'Hello'],
         ]);
-        expect($assistant->content)->toBe('Hello');
+        expect($response->text)->toBe('Hello');
     });
 });

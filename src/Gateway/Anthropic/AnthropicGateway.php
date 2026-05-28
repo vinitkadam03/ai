@@ -12,13 +12,13 @@ use Laravel\Ai\Contracts\Providers\ImageProvider;
 use Laravel\Ai\Contracts\Providers\TextProvider;
 use Laravel\Ai\Contracts\Providers\TranscriptionProvider;
 use Laravel\Ai\Gateway\Concerns\HandlesFailoverErrors;
-use Laravel\Ai\Gateway\Concerns\InvokesTools;
 use Laravel\Ai\Gateway\Concerns\ParsesServerSentEvents;
+use Laravel\Ai\Gateway\SingleTurnResponse;
+use Laravel\Ai\Gateway\StepContext;
 use Laravel\Ai\Gateway\TextGenerationOptions;
 use Laravel\Ai\Responses\AudioResponse;
 use Laravel\Ai\Responses\EmbeddingsResponse;
 use Laravel\Ai\Responses\ImageResponse;
-use Laravel\Ai\Responses\TextResponse;
 use Laravel\Ai\Responses\TranscriptionResponse;
 use LogicException;
 
@@ -32,13 +32,9 @@ class AnthropicGateway implements Gateway
     use Concerns\MapsTools;
     use Concerns\ParsesTextResponses;
     use HandlesFailoverErrors;
-    use InvokesTools;
     use ParsesServerSentEvents;
 
-    public function __construct(protected Dispatcher $events)
-    {
-        $this->initializeToolCallbacks();
-    }
+    public function __construct(protected Dispatcher $events) {}
 
     /**
      * {@inheritdoc}
@@ -52,7 +48,9 @@ class AnthropicGateway implements Gateway
         ?array $schema = null,
         ?TextGenerationOptions $options = null,
         ?int $timeout = null,
-    ): TextResponse {
+        ?string $previousResponseId = null,
+        ?StepContext $context = null,
+    ): SingleTurnResponse {
         $body = $this->buildTextRequestBody(
             $provider,
             $model,
@@ -72,16 +70,7 @@ class AnthropicGateway implements Gateway
 
         $this->validateTextResponse($data);
 
-        return $this->parseTextResponse(
-            $data,
-            $provider,
-            filled($schema),
-            $tools,
-            $schema,
-            $options,
-            $body,
-            $timeout,
-        );
+        return $this->parseTextResponse($data, $provider, filled($schema));
     }
 
     /**
@@ -97,6 +86,8 @@ class AnthropicGateway implements Gateway
         ?array $schema = null,
         ?TextGenerationOptions $options = null,
         ?int $timeout = null,
+        ?string $previousResponseId = null,
+        ?StepContext $context = null,
     ): Generator {
         $body = $this->buildTextRequestBody(
             $provider,
@@ -121,14 +112,7 @@ class AnthropicGateway implements Gateway
             $invocationId,
             $provider,
             $model,
-            $tools,
-            $schema,
-            $options,
             $response->getBody(),
-            $body,
-            0,
-            null,
-            $timeout,
         );
     }
 
